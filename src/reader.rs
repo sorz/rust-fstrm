@@ -1,12 +1,12 @@
+use byteorder::{BigEndian, ReadBytesExt};
 use std::{
+    cmp::min,
     collections::HashSet,
-    io::{Read, Result, ErrorKind, Write},
+    convert::TryInto,
+    io::{ErrorKind, Read, Result, Write},
     iter::FromIterator,
     marker::PhantomData,
-    convert::TryInto,
-    cmp::min,
 };
-use byteorder::{ReadBytesExt, BigEndian};
 
 pub mod states {
     pub struct Ready;
@@ -46,7 +46,10 @@ impl<R: Read, S: states::BeforeStart> FstrmReader<R, S> {
 impl<R: Read + Write> FstrmReader<R, states::Ready> {
     /// Read the READY frame then reply with ACCEPT, if content types are matched.
     /// Set allowed_content_types as empty to allow any content type.
-    pub fn accept<'a, T, S: 'a>(&mut self, allowed_content_types: T) -> Result<FstrmReader<R, states::Accepted>>
+    pub fn accept<'a, T, S: 'a>(
+        &mut self,
+        allowed_content_types: T,
+    ) -> Result<FstrmReader<R, states::Accepted>>
     where
         T: IntoIterator<Item = &'a S>,
         S: AsRef<str>,
@@ -56,7 +59,6 @@ impl<R: Read + Write> FstrmReader<R, states::Ready> {
 
         unimplemented!()
     }
-
 }
 
 impl<R: Read + Write> FstrmReader<R, states::Accepted> {
@@ -67,6 +69,8 @@ impl<R: Read + Write> FstrmReader<R, states::Accepted> {
 }
 
 impl<R: Read> FstrmReader<R, states::Started> {
+    // Read the next data frame, return None if the other side
+    // stop sending with a control frame.
     pub fn read_frame(&mut self) -> Result<Option<Frame<R>>> {
         let len = self.reader.read_u32::<BigEndian>()?;
         if len == 0 {
@@ -87,7 +91,9 @@ pub struct Frame<'a, R> {
 impl<'a, R> Frame<'a, R> {
     fn new(reader: &'a mut R, size: u32) -> Self {
         Self {
-            reader, size: size.try_into().unwrap(), pos: 0
+            reader,
+            size: size.try_into().unwrap(),
+            pos: 0,
         }
     }
 
@@ -101,7 +107,6 @@ impl<'a, R> Frame<'a, R> {
 }
 
 impl<'a, R: Read> Read for Frame<'a, R> {
-
     fn read(&mut self, buf: &mut [u8]) -> Result<usize> {
         let max_len = min(buf.len(), self.remaining());
         let n = self.reader.read(&mut buf[..max_len])?;
@@ -111,17 +116,5 @@ impl<'a, R: Read> Read for Frame<'a, R> {
         } else {
             Ok(n)
         }
-    }
-}
-
-pub struct Frames<'a, R> {
-    reader: &'a mut FstrmReader<R, states::Started>,
-}
-
-impl<'a, R: Read> Iterator for Frames<'a, R> {
-    type Item = Result<Frame<'a, R>>;
-
-    fn next(&mut self) -> Option<Result<Frame<'a, R>>> {
-        self.reader.read_frame().transpose()
     }
 }

@@ -1,0 +1,8 @@
+[package]
+name = "rust-fstrm"
+version = "0.1.0"
+authors = ["Shell Chen <me@sorz.org>"]
+edition = "2018"
+
+[dependencies]
+byteorder = "1.3"

@@ -65,20 +65,17 @@ impl<R, S> FstrmReader<R, S> {
     }
 }
 
+impl<R, S: states::BeforeStart> FstrmReader<R, S> {
+    fn allowed_content_types(&self) -> HashSet<&str> {
+        self.content_types.iter().map(|s| s.as_str()).collect()
+    }
+}
+
 impl<R: Read, S: states::BeforeStart> FstrmReader<R, S> {
     /// Read the START frame.
     pub fn start(mut self) -> Result<FstrmReader<R, states::Started>> {
-        let size = match self.read_frame_header()? {
-            FrameHeader::Control {
-                typ: ControlType::Start,
-                size,
-            } => size,
-            _ => return Err(io::Error::new(ErrorKind::InvalidData, "not a START frame")),
-        };
-        let mut frame = vec![0u8; size];
-        self.reader.read_exact(&mut frame)?;
-
-        let allowed_types: HashSet<&str> = self.content_types.iter().map(|s| s.as_str()).collect();
+        let frame = self.read_control_frame_of(ControlType::Start)?;
+        let allowed_types = self.allowed_content_types();
 
         let mut buf = &frame[..];
         let mut types: HashSet<&str> = HashSet::with_capacity(allowed_types.len());
@@ -124,19 +121,18 @@ impl<R: Read, S: states::BeforeStart> FstrmReader<R, S> {
 }
 
 impl<R: Read + Write> FstrmReader<R, states::Ready> {
-    /// Read the READY frame then reply with ACCEPT, if content types are matched.
-    /// Set allowed_content_types as empty to allow any content type.
-    pub fn accept<'a, T, I: 'a>(
-        &mut self,
-        allowed_content_types: T,
-    ) -> Result<FstrmReader<R, states::Accepted>>
+    /// Read the READY frame then reply with ACCEPT.
+    pub fn accept<'a, T, I: 'a>(&mut self) -> Result<FstrmReader<R, states::Accepted>>
     where
         T: IntoIterator<Item = &'a I>,
         I: AsRef<str>,
     {
-        let allowed_types: HashSet<&str> =
-            HashSet::from_iter(allowed_content_types.into_iter().map(|s| s.as_ref()));
+        let frame = self.read_control_frame_of(ControlType::Ready)?;
+        let allowed_types = self.allowed_content_types();
 
+        // TODO: parse content types
+
+        // TODO: write ACCEPT frame
         unimplemented!()
     }
 }
@@ -148,7 +144,7 @@ impl<R: Read + Write> FstrmReader<R, states::Accepted> {
     }
 }
 
-#[repr(u32)]
+#[derive(Debug, PartialEq)]
 enum ControlType {
     Accept,
     Start,
@@ -194,6 +190,27 @@ impl<R: Read, S> FstrmReader<R, S> {
                 Ok(FrameHeader::Control { size, typ })
             }
         }
+    }
+
+    fn read_control_frame_of(&mut self, expect_type: ControlType) -> Result<Box<[u8]>> {
+        let size = match self.read_frame_header()? {
+            FrameHeader::Data { .. } => {
+                return Err(io::Error::new(
+                    ErrorKind::InvalidData,
+                    "unexpected data frame",
+                ))
+            }
+            FrameHeader::Control { typ, size } if typ == expect_type => size,
+            _ => {
+                return Err(io::Error::new(
+                    ErrorKind::InvalidData,
+                    "unexpected type of control frame",
+                ))
+            }
+        };
+        let mut frame = vec![0u8; size];
+        self.reader.read_exact(&mut frame)?;
+        Ok(frame.into_boxed_slice())
     }
 }
 

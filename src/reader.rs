@@ -7,6 +7,7 @@ use std::{
     io::{self, ErrorKind, Read, Result, Write},
     iter::FromIterator,
     marker::PhantomData,
+    str,
 };
 
 const MAX_CONTROL_FRAME_SIZE: usize = 1024 * 1024;
@@ -31,13 +32,31 @@ pub mod states {
 pub struct FstrmReader<R, S> {
     reader: R,
     state: PhantomData<S>,
+    content_types: HashSet<String>,
 }
 
 impl<R, S> FstrmReader<R, S> {
+    /// Create a new reader that accpets all content types.
     pub fn new(reader: R) -> FstrmReader<R, states::Ready> {
         FstrmReader {
             reader,
             state: PhantomData,
+            content_types: HashSet::new(),
+        }
+    }
+
+    /// Create a new reader that accepts only given set of content types.
+    pub fn allow_content_types<T>(
+        reader: R,
+        allowed_content_types: T,
+    ) -> FstrmReader<R, states::Ready>
+    where
+        T: IntoIterator<Item = String>,
+    {
+        FstrmReader {
+            reader,
+            state: PhantomData,
+            content_types: HashSet::from_iter(allowed_content_types),
         }
     }
 
@@ -48,17 +67,7 @@ impl<R, S> FstrmReader<R, S> {
 
 impl<R: Read, S: states::BeforeStart> FstrmReader<R, S> {
     /// Read the START frame.
-    pub fn start<'a, T, I: 'a>(
-        mut self,
-        content_types: T,
-    ) -> Result<FstrmReader<R, states::Started>>
-    where
-        T: IntoIterator<Item = &'a I>,
-        I: AsRef<str>,
-    {
-        let content_types: HashSet<&[u8]> =
-            HashSet::from_iter(content_types.into_iter().map(|s| s.as_ref().as_bytes()));
-
+    pub fn start(mut self) -> Result<FstrmReader<R, states::Started>> {
         let size = match self.read_frame_header()? {
             FrameHeader::Control {
                 typ: ControlType::Start,
@@ -69,8 +78,10 @@ impl<R: Read, S: states::BeforeStart> FstrmReader<R, S> {
         let mut frame = vec![0u8; size];
         self.reader.read_exact(&mut frame)?;
 
+        let allowed_types: HashSet<&str> = self.content_types.iter().map(|s| s.as_str()).collect();
+
         let mut buf = &frame[..];
-        let mut types: HashSet<&[u8]> = HashSet::with_capacity(content_types.len());
+        let mut types: HashSet<&str> = HashSet::with_capacity(allowed_types.len());
         while !buf.is_empty() {
             let field_type = buf.read_u32::<BigEndian>()?;
             match field_type {
@@ -81,14 +92,23 @@ impl<R: Read, S: states::BeforeStart> FstrmReader<R, S> {
                         return Err(ErrorKind::UnexpectedEof.into());
                     }
                     let (typ, remaining) = buf.split_at(size);
-                    types.insert(typ);
+                    types.insert(str::from_utf8(typ).map_err(|_| {
+                        io::Error::new(ErrorKind::InvalidData, "content type with invalid utf-8")
+                    })?);
                     buf = remaining;
                 }
                 _ => info!("unknown control field: {}", field_type),
             }
         }
 
-        if !content_types.is_empty() && content_types != types {
+        let content_types = if allowed_types.is_empty() {
+            // Allow any types
+            HashSet::from_iter(types.into_iter().map(|s| s.to_string()))
+        } else {
+            HashSet::from_iter(allowed_types.intersection(&types).map(|s| s.to_string()))
+        };
+
+        if content_types.is_empty() {
             Err(io::Error::new(
                 ErrorKind::InvalidData,
                 "content types mismatched",
@@ -97,6 +117,7 @@ impl<R: Read, S: states::BeforeStart> FstrmReader<R, S> {
             Ok(FstrmReader {
                 reader: self.reader,
                 state: PhantomData,
+                content_types,
             })
         }
     }
@@ -176,9 +197,16 @@ impl<R: Read, S> FstrmReader<R, S> {
     }
 }
 
+impl<R> FstrmReader<R, states::Started> {
+    /// Negotiated content types
+    pub fn content_types(&self) -> &HashSet<String> {
+        &self.content_types
+    }
+}
+
 impl<R: Read> FstrmReader<R, states::Started> {
-    // Read the next data frame, return None if the other side
-    // stop sending with a control frame.
+    /// Read the next data frame, return None if the other side
+    /// stop sending with a control frame.
     pub fn read_frame(&mut self) -> Result<Option<Frame<R>>> {
         match self.read_frame_header()? {
             FrameHeader::Data { size } => Ok(Some(Frame::new(&mut self.reader, size))),

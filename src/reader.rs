@@ -10,13 +10,16 @@ use std::{
     str,
 };
 
-const MAX_CONTROL_FRAME_SIZE: usize = 1024 * 1024;
+// Constants copy from `fstrm/control.h`
+const CONTROL_FRAME_LENGTH_MAX: usize = 512;
+const CONTROL_FIELD_CONTENT_TYPE_LENGTH_MAX: usize = 256;
 
 const CONTROL_TYPE_ACCEPT: u32 = 0x01;
 const CONTROL_TYPE_START: u32 = 0x02;
 const CONTROL_TYPE_STOP: u32 = 0x03;
 const CONTROL_TYPE_READY: u32 = 0x04;
 const CONTROL_TYPE_FINISH: u32 = 0x05;
+
 const CONTROL_FIELD_CONTENT_TYPE: u32 = 0x01;
 
 pub mod states {
@@ -65,44 +68,29 @@ impl<R, S> FstrmReader<R, S> {
     }
 }
 
-impl<R, S: states::BeforeStart> FstrmReader<R, S> {
-    fn allowed_content_types(&self) -> HashSet<&str> {
-        self.content_types.iter().map(|s| s.as_str()).collect()
-    }
-}
-
 impl<R: Read, S: states::BeforeStart> FstrmReader<R, S> {
     /// Read the START frame.
     pub fn start(mut self) -> Result<FstrmReader<R, states::Started>> {
-        let frame = self.read_control_frame_of(ControlType::Start)?;
-        let allowed_types = self.allowed_content_types();
-
-        let mut buf = &frame[..];
-        let mut types: HashSet<&str> = HashSet::with_capacity(allowed_types.len());
-        while !buf.is_empty() {
-            let field_type = buf.read_u32::<BigEndian>()?;
-            match field_type {
-                CONTROL_FIELD_CONTENT_TYPE => {
-                    let size = buf.read_u32::<BigEndian>()? as usize;
-                    if size > buf.len() {
-                        warn!("paring error: control field too long");
-                        return Err(ErrorKind::UnexpectedEof.into());
-                    }
-                    let (typ, remaining) = buf.split_at(size);
-                    types.insert(str::from_utf8(typ).map_err(|_| {
-                        io::Error::new(ErrorKind::InvalidData, "content type with invalid utf-8")
-                    })?);
-                    buf = remaining;
-                }
-                _ => info!("unknown control field: {}", field_type),
-            }
+        let ControlFrame { typ, fields } = self.read_control_frame()?;
+        if typ != ControlType::Start {
+            return Err(io::Error::new(
+                ErrorKind::InvalidData,
+                "received frame was not START",
+            ));
         }
+        let types: HashSet<String> = fields
+            .into_iter()
+            .filter_map(|field| match field {
+                ControlFrameField::ContentType(typ) => Some(typ),
+                _ => None,
+            })
+            .collect();
 
-        let content_types = if allowed_types.is_empty() {
+        let content_types = if self.content_types.is_empty() {
             // Allow any types
-            HashSet::from_iter(types.into_iter().map(|s| s.to_string()))
+            types
         } else {
-            HashSet::from_iter(allowed_types.intersection(&types).map(|s| s.to_string()))
+            HashSet::from_iter(self.content_types.intersection(&types).cloned())
         };
 
         if content_types.is_empty() {
@@ -122,13 +110,20 @@ impl<R: Read, S: states::BeforeStart> FstrmReader<R, S> {
 
 impl<R: Read + Write> FstrmReader<R, states::Ready> {
     /// Read the READY frame then reply with ACCEPT.
-    pub fn accept<'a, T, I: 'a>(&mut self) -> Result<FstrmReader<R, states::Accepted>>
+    pub fn accept<'a, T, I: 'a>(mut self) -> Result<FstrmReader<R, states::Accepted>>
     where
         T: IntoIterator<Item = &'a I>,
         I: AsRef<str>,
     {
-        let frame = self.read_control_frame_of(ControlType::Ready)?;
-        let allowed_types = self.allowed_content_types();
+        let ControlFrame { typ, fields } = self.read_control_frame()?;
+        if typ != ControlType::Ready {
+            return Err(io::Error::new(
+                ErrorKind::InvalidData,
+                "received frame was not READY",
+            ));
+        }
+
+        let allowed_types = self.content_types;
 
         // TODO: parse content types
 
@@ -184,7 +179,7 @@ impl<R: Read, S> FstrmReader<R, S> {
         } else {
             let size = self.next_length()?;
             let typ = self.reader.read_u32::<BigEndian>()?.into();
-            if size > MAX_CONTROL_FRAME_SIZE {
+            if size > CONTROL_FRAME_LENGTH_MAX {
                 Err(io::Error::new(ErrorKind::Other, "control frame too large"))
             } else {
                 Ok(FrameHeader::Control { size, typ })
@@ -192,15 +187,15 @@ impl<R: Read, S> FstrmReader<R, S> {
         }
     }
 
-    fn read_control_frame_of(&mut self, expect_type: ControlType) -> Result<Box<[u8]>> {
-        let size = match self.read_frame_header()? {
+    fn read_control_frame(&mut self) -> Result<ControlFrame> {
+        let (typ, size) = match self.read_frame_header()? {
             FrameHeader::Data { .. } => {
                 return Err(io::Error::new(
                     ErrorKind::InvalidData,
                     "unexpected data frame",
                 ))
             }
-            FrameHeader::Control { typ, size } if typ == expect_type => size,
+            FrameHeader::Control { typ, size } => (typ, size),
             _ => {
                 return Err(io::Error::new(
                     ErrorKind::InvalidData,
@@ -210,7 +205,33 @@ impl<R: Read, S> FstrmReader<R, S> {
         };
         let mut frame = vec![0u8; size];
         self.reader.read_exact(&mut frame)?;
-        Ok(frame.into_boxed_slice())
+
+        let mut buf = &frame[..];
+        let mut fields: Vec<ControlFrameField> = vec![];
+        while !buf.is_empty() {
+            let field_type = buf.read_u32::<BigEndian>()?;
+            let field = match field_type {
+                CONTROL_FIELD_CONTENT_TYPE => {
+                    let size = buf.read_u32::<BigEndian>()? as usize;
+                    if size > buf.len() {
+                        warn!("paring error: control field too long");
+                        return Err(ErrorKind::UnexpectedEof.into());
+                    }
+                    let (typ, remaining) = buf.split_at(size);
+                    let typ = String::from_utf8(typ.to_vec()).map_err(|_| {
+                        io::Error::new(ErrorKind::InvalidData, "content type with invalid utf-8")
+                    })?;
+                    buf = remaining;
+                    ControlFrameField::ContentType(typ)
+                }
+                typ => {
+                    info!("unknown control field: {}", field_type);
+                    ControlFrameField::Unknown(typ)
+                }
+            };
+            fields.push(field);
+        }
+        Ok(ControlFrame { typ, fields })
     }
 }
 
@@ -224,9 +245,9 @@ impl<R> FstrmReader<R, states::Started> {
 impl<R: Read> FstrmReader<R, states::Started> {
     /// Read the next data frame, return None if the other side
     /// stop sending with a control frame.
-    pub fn read_frame(&mut self) -> Result<Option<Frame<R>>> {
+    pub fn read_frame(&mut self) -> Result<Option<DataFrame<R>>> {
         match self.read_frame_header()? {
-            FrameHeader::Data { size } => Ok(Some(Frame::new(&mut self.reader, size))),
+            FrameHeader::Data { size } => Ok(Some(DataFrame::new(&mut self.reader, size))),
             FrameHeader::Control { size, typ } => {
                 // TODO: handle control frame
                 Ok(None)
@@ -235,13 +256,23 @@ impl<R: Read> FstrmReader<R, states::Started> {
     }
 }
 
-pub struct Frame<'a, R> {
+pub enum ControlFrameField {
+    ContentType(String),
+    Unknown(u32),
+}
+
+pub struct ControlFrame {
+    typ: ControlType,
+    fields: Vec<ControlFrameField>,
+}
+
+pub struct DataFrame<'a, R> {
     reader: &'a mut R,
     size: usize,
     pos: usize,
 }
 
-impl<'a, R> Frame<'a, R> {
+impl<'a, R> DataFrame<'a, R> {
     fn new(reader: &'a mut R, size: usize) -> Self {
         Self {
             reader,
@@ -259,7 +290,7 @@ impl<'a, R> Frame<'a, R> {
     }
 }
 
-impl<'a, R: Read> Read for Frame<'a, R> {
+impl<'a, R: Read> Read for DataFrame<'a, R> {
     fn read(&mut self, buf: &mut [u8]) -> Result<usize> {
         let max_len = min(buf.len(), self.remaining());
         let n = self.reader.read(&mut buf[..max_len])?;

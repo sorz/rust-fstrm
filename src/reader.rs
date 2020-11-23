@@ -68,43 +68,37 @@ impl<R, S> FstrmReader<R, S> {
     }
 }
 
+fn intersect_content_types(
+    src: HashSet<String>,
+    types: HashSet<String>,
+) -> Result<HashSet<String>> {
+    let set = if src.is_empty() {
+        types
+    } else {
+        HashSet::from_iter(src.intersection(&types).cloned())
+    };
+    if set.is_empty() {
+        Err(io::Error::new(
+            ErrorKind::InvalidData,
+            "content types mismatched",
+        ))
+    } else {
+        Ok(set)
+    }
+}
+
 impl<R: Read, S: states::BeforeStart> FstrmReader<R, S> {
     /// Read the START frame.
     pub fn start(mut self) -> Result<FstrmReader<R, states::Started>> {
-        let ControlFrame { typ, fields } = self.read_control_frame()?;
-        if typ != ControlType::Start {
-            return Err(io::Error::new(
-                ErrorKind::InvalidData,
-                "received frame was not START",
-            ));
-        }
-        let types: HashSet<String> = fields
-            .into_iter()
-            .filter_map(|field| match field {
-                ControlFrameField::ContentType(typ) => Some(typ),
-                _ => None,
-            })
-            .collect();
-
-        let content_types = if self.content_types.is_empty() {
-            // Allow any types
-            types
-        } else {
-            HashSet::from_iter(self.content_types.intersection(&types).cloned())
-        };
-
-        if content_types.is_empty() {
-            Err(io::Error::new(
-                ErrorKind::InvalidData,
-                "content types mismatched",
-            ))
-        } else {
-            Ok(FstrmReader {
-                reader: self.reader,
-                state: PhantomData,
-                content_types,
-            })
-        }
+        let frame = self.read_control_frame()?;
+        frame.assert_type(ControlType::Start)?;
+        let types = frame.content_types();
+        let content_types = intersect_content_types(self.content_types, types)?;
+        Ok(FstrmReader {
+            reader: self.reader,
+            state: PhantomData,
+            content_types,
+        })
     }
 }
 
@@ -115,17 +109,10 @@ impl<R: Read + Write> FstrmReader<R, states::Ready> {
         T: IntoIterator<Item = &'a I>,
         I: AsRef<str>,
     {
-        let ControlFrame { typ, fields } = self.read_control_frame()?;
-        if typ != ControlType::Ready {
-            return Err(io::Error::new(
-                ErrorKind::InvalidData,
-                "received frame was not READY",
-            ));
-        }
-
-        let allowed_types = self.content_types;
-
-        // TODO: parse content types
+        let frame = self.read_control_frame()?;
+        frame.assert_type(ControlType::Ready)?;
+        let types = frame.content_types();
+        let content_types = intersect_content_types(self.content_types, types)?;
 
         // TODO: write ACCEPT frame
         unimplemented!()
@@ -210,13 +197,13 @@ impl<R: Read, S> FstrmReader<R, S> {
         let mut fields: Vec<ControlFrameField> = vec![];
         while !buf.is_empty() {
             let field_type = buf.read_u32::<BigEndian>()?;
+            let size = buf.read_u32::<BigEndian>()? as usize;
+            if size > buf.len() || size > CONTROL_FIELD_CONTENT_TYPE_LENGTH_MAX {
+                warn!("paring error: control field too long");
+                return Err(ErrorKind::UnexpectedEof.into());
+            }
             let field = match field_type {
                 CONTROL_FIELD_CONTENT_TYPE => {
-                    let size = buf.read_u32::<BigEndian>()? as usize;
-                    if size > buf.len() {
-                        warn!("paring error: control field too long");
-                        return Err(ErrorKind::UnexpectedEof.into());
-                    }
                     let (typ, remaining) = buf.split_at(size);
                     let typ = String::from_utf8(typ.to_vec()).map_err(|_| {
                         io::Error::new(ErrorKind::InvalidData, "content type with invalid utf-8")
@@ -226,6 +213,7 @@ impl<R: Read, S> FstrmReader<R, S> {
                 }
                 typ => {
                     info!("unknown control field: {}", field_type);
+                    buf = &buf[size..];
                     ControlFrameField::Unknown(typ)
                 }
             };
@@ -264,6 +252,29 @@ pub enum ControlFrameField {
 pub struct ControlFrame {
     typ: ControlType,
     fields: Vec<ControlFrameField>,
+}
+
+impl ControlFrame {
+    fn assert_type(&self, typ: ControlType) -> Result<()> {
+        if self.typ == typ {
+            Ok(())
+        } else {
+            Err(io::Error::new(
+                ErrorKind::InvalidData,
+                format!("expect frame {:?} but {:?} received", typ, self.typ),
+            ))
+        }
+    }
+
+    fn content_types(self) -> HashSet<String> {
+        self.fields
+            .into_iter()
+            .filter_map(|field| match field {
+                ControlFrameField::ContentType(typ) => Some(typ),
+                _ => None,
+            })
+            .collect()
+    }
 }
 
 pub struct DataFrame<'a, R> {

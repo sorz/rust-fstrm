@@ -1,5 +1,5 @@
 [package]
-name = "rust-fstrm"
+name = "fstrm"
 version = "0.1.0"
 authors = ["Shell Chen <me@sorz.org>"]
 edition = "2018"

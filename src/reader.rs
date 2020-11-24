@@ -1,5 +1,5 @@
 use byteorder::{BigEndian, ReadBytesExt};
-use log::{info, warn};
+use log::{info, trace, warn};
 use std::{
     cmp::min,
     collections::HashSet,
@@ -162,14 +162,21 @@ impl<R: Read, S> FstrmReader<R, S> {
     fn read_frame_header(&mut self) -> Result<FrameHeader> {
         let size = self.next_length()?;
         if size > 0 {
+            trace!("data frame ({} bytes)", size);
             Ok(FrameHeader::Data { size })
         } else {
             let size = self.next_length()?;
-            let typ = self.reader.read_u32::<BigEndian>()?.into();
             if size > CONTROL_FRAME_LENGTH_MAX {
                 Err(io::Error::new(ErrorKind::Other, "control frame too large"))
+            } else if size < 4 {
+                Err(io::Error::new(ErrorKind::Other, "control frame too small"))
             } else {
-                Ok(FrameHeader::Control { size, typ })
+                let typ = self.reader.read_u32::<BigEndian>()?.into();
+                trace!("control frame {:?} ({} bytes)", typ, size);
+                Ok(FrameHeader::Control {
+                    size: size - 4,
+                    typ,
+                })
             }
         }
     }
@@ -183,12 +190,6 @@ impl<R: Read, S> FstrmReader<R, S> {
                 ))
             }
             FrameHeader::Control { typ, size } => (typ, size),
-            _ => {
-                return Err(io::Error::new(
-                    ErrorKind::InvalidData,
-                    "unexpected type of control frame",
-                ))
-            }
         };
         let mut frame = vec![0u8; size];
         self.reader.read_exact(&mut frame)?;
@@ -202,18 +203,17 @@ impl<R: Read, S> FstrmReader<R, S> {
                 warn!("paring error: control field too long");
                 return Err(ErrorKind::UnexpectedEof.into());
             }
+            let (field_content, remaining) = buf.split_at(size);
+            buf = remaining;
             let field = match field_type {
                 CONTROL_FIELD_CONTENT_TYPE => {
-                    let (typ, remaining) = buf.split_at(size);
-                    let typ = String::from_utf8(typ.to_vec()).map_err(|_| {
+                    let typ = String::from_utf8(field_content.to_vec()).map_err(|_| {
                         io::Error::new(ErrorKind::InvalidData, "content type with invalid utf-8")
                     })?;
-                    buf = remaining;
                     ControlFrameField::ContentType(typ)
                 }
                 typ => {
                     info!("unknown control field: {}", field_type);
-                    buf = &buf[size..];
                     ControlFrameField::Unknown(typ)
                 }
             };
@@ -236,10 +236,11 @@ impl<R: Read> FstrmReader<R, states::Started> {
     pub fn read_frame(&mut self) -> Result<Option<DataFrame<R>>> {
         match self.read_frame_header()? {
             FrameHeader::Data { size } => Ok(Some(DataFrame::new(&mut self.reader, size))),
-            FrameHeader::Control { size, typ } => {
-                // TODO: handle control frame
-                Ok(None)
-            }
+            FrameHeader::Control { typ, .. } if typ == ControlType::Stop => Ok(None),
+            FrameHeader::Control { typ, .. } => Err(io::Error::new(
+                ErrorKind::InvalidData,
+                format!("unexpected control frame {:?}", typ),
+            )),
         }
     }
 }

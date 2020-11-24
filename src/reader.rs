@@ -1,4 +1,4 @@
-use byteorder::{BigEndian, ReadBytesExt};
+use byteorder::{BigEndian, ReadBytesExt, WriteBytesExt};
 use log::{info, trace, warn};
 use std::{
     cmp::min,
@@ -7,7 +7,6 @@ use std::{
     io::{self, ErrorKind, Read, Result, Write},
     iter::FromIterator,
     marker::PhantomData,
-    str,
 };
 
 // Constants copy from `fstrm/control.h`
@@ -30,6 +29,10 @@ pub mod states {
     pub trait BeforeStart {}
     impl BeforeStart for Ready {}
     impl BeforeStart for Accepted {}
+
+    pub trait AfterReady {}
+    impl AfterReady for Accepted {}
+    impl AfterReady for Started {}
 }
 
 pub struct FstrmReader<R, S> {
@@ -104,25 +107,38 @@ impl<R: Read, S: states::BeforeStart> FstrmReader<R, S> {
 
 impl<R: Read + Write> FstrmReader<R, states::Ready> {
     /// Read the READY frame then reply with ACCEPT.
-    pub fn accept<'a, T, I: 'a>(mut self) -> Result<FstrmReader<R, states::Accepted>>
-    where
-        T: IntoIterator<Item = &'a I>,
-        I: AsRef<str>,
-    {
+    pub fn accept(mut self) -> Result<FstrmReader<R, states::Accepted>> {
         let frame = self.read_control_frame()?;
         frame.assert_type(ControlType::Ready)?;
         let types = frame.content_types();
         let content_types = intersect_content_types(self.content_types, types)?;
 
-        // TODO: write ACCEPT frame
-        unimplemented!()
+        let mut buf = Vec::with_capacity(12);
+        buf.write_u32::<BigEndian>(CONTROL_TYPE_ACCEPT)?;
+        for typ in content_types.iter() {
+            buf.write_u32::<BigEndian>(CONTROL_FIELD_CONTENT_TYPE)?;
+            buf.write_u32::<BigEndian>(typ.len() as u32)?;
+            buf.write_all(typ.as_bytes())?;
+        }
+        self.reader.write_u32::<BigEndian>(0)?; // escape
+        self.reader.write_u32::<BigEndian>(buf.len() as u32)?;
+        self.reader.write_all(&buf)?;
+
+        Ok(FstrmReader {
+            reader: self.reader,
+            state: PhantomData,
+            content_types,
+        })
     }
 }
 
-impl<R: Read + Write> FstrmReader<R, states::Accepted> {
-    /// Write FINISH frame, return the inner reader.
-    pub fn finish(&self) -> Result<R> {
-        unimplemented!()
+impl<R: Read + Write, S: states::AfterReady> FstrmReader<R, S> {
+    /// Write FINISH frame to sender, return the inner reader.
+    pub fn finish(mut self) -> Result<R> {
+        self.reader.write_u32::<BigEndian>(0)?; // escape
+        self.reader.write_u32::<BigEndian>(4)?; // length
+        self.reader.write_u32::<BigEndian>(CONTROL_TYPE_FINISH)?;
+        Ok(self.reader)
     }
 }
 

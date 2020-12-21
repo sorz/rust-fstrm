@@ -41,31 +41,31 @@ pub struct FstrmReader<R, S> {
     content_types: HashSet<String>,
 }
 
+/// Create a new reader that accpets all content types.
+pub fn reader<R>(reader: R) -> FstrmReader<R, states::Ready> {
+    FstrmReader {
+        reader,
+        state: PhantomData,
+        content_types: HashSet::new(),
+    }
+}
+
+/// Create a new reader that accepts only given set of content types.
+pub fn reader_for_content_types<R, T>(
+    reader: R,
+    allowed_content_types: T,
+) -> FstrmReader<R, states::Ready>
+where
+    T: IntoIterator<Item = String>,
+{
+    FstrmReader {
+        reader,
+        state: PhantomData,
+        content_types: HashSet::from_iter(allowed_content_types),
+    }
+}
+
 impl<R, S> FstrmReader<R, S> {
-    /// Create a new reader that accpets all content types.
-    pub fn new(reader: R) -> FstrmReader<R, states::Ready> {
-        FstrmReader {
-            reader,
-            state: PhantomData,
-            content_types: HashSet::new(),
-        }
-    }
-
-    /// Create a new reader that accepts only given set of content types.
-    pub fn allow_content_types<T>(
-        reader: R,
-        allowed_content_types: T,
-    ) -> FstrmReader<R, states::Ready>
-    where
-        T: IntoIterator<Item = String>,
-    {
-        FstrmReader {
-            reader,
-            state: PhantomData,
-            content_types: HashSet::from_iter(allowed_content_types),
-        }
-    }
-
     pub fn into_inner(self) -> R {
         self.reader
     }

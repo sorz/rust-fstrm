@@ -1,4 +1,4 @@
-use crate::FstrmReader;
+use crate::reader;
 use std::io::Read;
 
 #[test]
@@ -16,7 +16,7 @@ fn test_unidirectional_reader() {
         0, 0, 0, 3, // control type: STOP
     ];
 
-    let reader = FstrmReader::<_, ()>::new(&bytes[..]);
+    let reader = reader::reader(&bytes[..]);
     let mut reader = reader.start().unwrap();
     let types = reader.content_types();
     assert_eq!(types.len(), 1);

@@ -1,4 +1,4 @@
-use crate::reader;
+use fstrm::reader;
 use std::io::Read;
 
 #[test]

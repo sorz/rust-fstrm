@@ -1,8 +1,10 @@
-use fstrm::reader;
-use std::io::Read;
-
 #[test]
 fn test_unidirectional_reader() {
+    use fstrm::control::ContentType;
+    use fstrm::reader::uni_directional::Build;
+    use fstrm::reader::*;
+    use fstrm::*;
+
     let bytes: [u8; 65] = [
         0, 0, 0, 0, 0, 0, 0, 29, // control frame, length 29
         0, 0, 0, 2, // control type: START
@@ -16,16 +18,18 @@ fn test_unidirectional_reader() {
         0, 0, 0, 3, // control type: STOP
     ];
 
-    let reader = reader::reader(&bytes[..]);
-    let mut reader = reader.start().unwrap();
-    let types = reader.content_types();
-    assert_eq!(types.len(), 1);
-    assert!(types.contains("test-content-type"));
+    let content_type: ContentType = "test-content-type".into();
+    let content_types = vec![content_type.clone()];
 
-    let mut frame = reader.read_frame().unwrap().unwrap();
-    let mut buf = String::new();
-    frame.read_to_string(&mut buf).unwrap();
-    assert_eq!(buf, "test-content");
+    let mut builder = Builder::new(&bytes[..], &content_types);
+    let mut reader = builder.build().unwrap();
 
-    assert!(reader.read_frame().unwrap().is_none());
+    assert_eq!(reader.content_type_ref(), Some(&content_type));
+
+    assert_eq!(
+        reader.next().unwrap().unwrap(),
+        <&str as Into<Payload>>::into("test-content")
+    );
+
+    assert!(reader.next().is_none());
 }
